@@ -42,3 +42,5 @@ anytool/llm/remote_client/
 
 # Local server temp files
 anytool/local_server/temp/
+
+examples/

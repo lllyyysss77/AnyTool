@@ -125,6 +125,18 @@ class GroundingAgent(BaseAgent):
                 
                 assistant_message = llm_response.get("message", {})
                 assistant_content = assistant_message.get("content", "")
+                
+                has_tool_calls = llm_response.get('has_tool_calls', False)
+                logger.info(f"Iteration {current_iteration} - Has tool calls: {has_tool_calls}, "
+                          f"Tool results: {len(tool_results_this_iteration)}, "
+                          f"Content length: {len(assistant_content)} chars")
+                
+                if len(assistant_content) > 0:
+                    logger.info(f"Iteration {current_iteration} - Assistant content preview: {repr(assistant_content[:300])}")
+                else:
+                    if not has_tool_calls:
+                        logger.warning(f"Iteration {current_iteration} - NO tool calls and NO content (potential infinite loop)")
+                
                 is_complete = GroundingAgentPrompts.TASK_COMPLETE in assistant_content
                 
                 if is_complete:

@@ -10,6 +10,7 @@ from anytool.agents import GroundingAgent
 from anytool.llm import LLMClient
 from anytool.grounding.core.grounding_client import GroundingClient
 from anytool.config import get_config, load_config
+from anytool.config.loader import get_agent_config
 from anytool.recording import RecordingManager
 from anytool.utils.logging import Logger
 
@@ -19,7 +20,7 @@ logger = Logger.get_logger(__name__)
 @dataclass
 class AnyToolConfig:
     # LLM Configuration
-    llm_model: str = "anthropic/claude-sonnet-4-5"
+    llm_model: str = "openrouter/anthropic/claude-sonnet-4.5"
     llm_enable_thinking: bool = False
     llm_timeout: float = 120.0
     llm_max_retries: int = 3
@@ -113,7 +114,20 @@ class AnyTool:
                 )
                 logger.info(f"✓ Recording enabled: {len(self._recording_manager.backends or [])} backends")
             
-            backend_scope = self.config.backend_scope or ["gui", "shell", "mcp", "web", "system"]
+            agent_config = get_agent_config("GroundingAgent")
+            if agent_config:
+                # Use config file values, fall back to AnyToolConfig defaults
+                max_iterations = agent_config.get("max_iterations", self.config.grounding_max_iterations)
+                backend_scope = agent_config.get("backend_scope", self.config.backend_scope or ["gui", "shell", "mcp", "web", "system"])
+                # Update config with values from config file
+                self.config.grounding_max_iterations = max_iterations
+                logger.info(f"Loaded GroundingAgent config from config_agents.json (max_iterations={max_iterations})")
+            else:
+                # Fall back to AnyToolConfig values
+                max_iterations = self.config.grounding_max_iterations
+                backend_scope = self.config.backend_scope or ["gui", "shell", "mcp", "web", "system"]
+                logger.warning(f"config_agents.json not found, using default config (max_iterations={max_iterations})")
+            
             self._grounding_agent = GroundingAgent(
                 name="AnyTool-GroundingAgent",
                 backend_scope=backend_scope,
@@ -121,7 +135,7 @@ class AnyTool:
                 grounding_client=self._grounding_client,
                 recording_manager=self._recording_manager,
                 system_prompt=self.config.grounding_system_prompt,
-                max_iterations=self.config.grounding_max_iterations,
+                max_iterations=max_iterations,
             )
             logger.info(f"✓ GroundingAgent: {', '.join(backend_scope)}")
             
