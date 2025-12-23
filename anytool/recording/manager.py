@@ -592,7 +592,6 @@ class RecordingManager:
         command = query if query else "deep_research"
         
         result_str = str(result.content) if result.is_success else str(result.error)
-        result_brief = result_str[:200] + "..." if len(result_str) > 200 else result_str
         
         is_actual_success = result.is_success
         if result.is_success and result_str:
@@ -604,7 +603,7 @@ class RecordingManager:
             command=command,
             result={
                 "status": "success" if is_actual_success else "error",
-                "output": result_brief,
+                "output": result_str,  # Full output preserved for training/replay
             },
             auto_screenshot=self.enable_screenshot
         )

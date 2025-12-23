@@ -58,6 +58,7 @@ class BaseTool(ABC):
         )
         
         self._runtime_info: Optional[ToolRuntimeInfo] = None
+        self._disable_outer_recording = True
     
     @property
     def name(self) -> str:

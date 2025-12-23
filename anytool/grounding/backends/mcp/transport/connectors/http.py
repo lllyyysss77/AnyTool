@@ -5,6 +5,7 @@ This module provides a connector for communicating with MCP implementations
 through HTTP APIs with SSE or Streamable HTTP for transport.
 """
 
+import anyio
 import httpx
 from mcp import ClientSession
 
@@ -72,15 +73,21 @@ class HttpConnector(MCPBaseConnector):
                 self.base_url, self.headers, self.timeout, self.sse_read_timeout
             )
 
-            # Test the connection by starting it
-            read_stream, write_stream = await connection_manager.start()
+            # Test the connection by starting it (with timeout using anyio)
+            try:
+                with anyio.fail_after(self.timeout):
+                    read_stream, write_stream = await connection_manager.start()
+            except TimeoutError:
+                raise TimeoutError(f"Streamable HTTP connection timed out after {self.timeout}s")
 
             # Verify it works by testing ClientSession initialization
             test_client = ClientSession(read_stream, write_stream, sampling_callback=None)
             await test_client.__aenter__()
 
             try:
-                await test_client.initialize()
+                # Add timeout to initialize() using anyio to prevent hanging
+                with anyio.fail_after(self.timeout):
+                    await test_client.initialize()
                 # Success! Clean up test client, stop the connection, and keep the manager
                 await test_client.__aexit__(None, None, None)
                 await connection_manager.stop()
@@ -89,6 +96,9 @@ class HttpConnector(MCPBaseConnector):
                 self._connection_manager = connection_manager
                 logger.debug("Streamable HTTP transport selected")
                 return
+            except TimeoutError:
+                await test_client.__aexit__(None, None, None)
+                raise TimeoutError(f"Streamable HTTP initialization timed out after {self.timeout}s")
             except Exception as init_error:
                 # Clean up the test client
                 await test_client.__aexit__(None, None, None)

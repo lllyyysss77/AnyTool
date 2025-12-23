@@ -100,21 +100,6 @@ class GUIAgentTool(BaseTool):
         logger.info(f"Starting GUI task: {task_description}")
         self.action_history = []
         
-        # Check if we have recording_manager (directly or via runtime_info)
-        has_recording = self.recording_manager is not None
-        if not has_recording and hasattr(self, '_runtime_info') and self._runtime_info:
-            grounding_client = self._runtime_info.grounding_client
-            if grounding_client and hasattr(grounding_client, 'recording_manager'):
-                has_recording = grounding_client.recording_manager is not None
-        
-        # Only disable outer layer recording if we have recording_manager for intermediate steps
-        if has_recording:
-            self._disable_outer_recording = True
-            logger.debug("Outer recording disabled (using intermediate step recording)")
-        else:
-            self._disable_outer_recording = False
-            logger.debug("Outer recording enabled (no recording_manager for intermediate steps)")
-        
         # Execute task with LLM planning loop
         try:
             result = await self._execute_task_with_planning(

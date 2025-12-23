@@ -205,7 +205,7 @@ class ToolRanker:
         except ImportError:
             BM25Okapi = None  # fallback below
 
-        tool_list = list[BaseTool](tools)
+        tool_list = list(tools)
         if not tool_list:
             return []
         

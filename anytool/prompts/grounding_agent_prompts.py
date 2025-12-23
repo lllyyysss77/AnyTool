@@ -173,12 +173,11 @@ Guidelines:
     @staticmethod
     def workspace_directory(workspace_dir: str) -> str:
         """
-        Build workspace directory information message.
+        Build workspace directory information for cross-iteration/cross-backend data sharing.
         """
-        return f"""**Workspace Directory**: `{workspace_dir}`
-- When saving files, use this path as the base directory
-- When reading files, look for them in this path first
-- All file operations should be performed relative to this workspace"""
+        return f"""**Working Directory**: `{workspace_dir}`
+- Persist intermediate results here; later iterations/backends can read what you saved earlier
+- Note: User's personal files are NOT here - search in ~/Desktop, ~/Documents, ~/Downloads, etc."""
     
     @staticmethod
     def workspace_matching_files(matching_files: List[str]) -> str:

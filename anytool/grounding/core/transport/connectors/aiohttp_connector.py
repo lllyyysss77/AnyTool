@@ -74,8 +74,27 @@ class AioHttpConnector(BaseConnector[aiohttp.ClientSession]):
         **kw,
     ) -> Any | BaseModel:
         resp = await self._request("POST", path, json=payload, **kw)
-        resp.raise_for_status()
-        data = await resp.json()
+        
+        try:
+            data = await resp.json()
+        except Exception:
+            data = None
+        
+        if resp.status >= 400:
+            # Extract detailed error from response body
+            detail = ""
+            if data:
+                detail = data.get("output") or data.get("message") or data.get("error") or ""
+            error_msg = f"{resp.status}, message='{resp.reason}'"
+            if detail:
+                error_msg += f", detail='{detail}'"
+            raise aiohttp.ClientResponseError(
+                resp.request_info,
+                resp.history,
+                status=resp.status,
+                message=error_msg,
+            )
+        
         return self._parse_as(data, response_model)
 
     async def request(self, method: str, path: str, **kw) -> aiohttp.ClientResponse:
