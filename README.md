@@ -76,8 +76,8 @@ async with AnyTool() as tool_layer:
 git clone https://github.com/HKUDS/AnyTool.git
 cd AnyTool
 
-# Create and activate conda environment
-conda create -n anytool python=3.12 -y
+# Create and activate conda environment (includes ffmpeg for video recording)
+conda create -n anytool python=3.12 ffmpeg -c conda-forge -y
 conda activate anytool
 
 # Install dependencies
