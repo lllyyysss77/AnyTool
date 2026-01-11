@@ -16,7 +16,9 @@
     "sandbox": false,
     "auto_initialize": true,
     "eager_sessions": false,
-    "sse_read_timeout": 300.0
+    "sse_read_timeout": 300.0,
+    "check_dependencies": true,
+    "auto_install": true
   },
   "gui": {
     "timeout": 90,
@@ -39,7 +41,7 @@
   "tool_quality": {
     "enabled": true,
     "enable_persistence": true,
-    "cache_dir": ".anytool/tool_quality",
+    "cache_dir": null,
     "auto_evaluate_descriptions": true,
     "enable_quality_ranking": true,
     "evolve_interval": 5

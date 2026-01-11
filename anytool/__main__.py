@@ -145,8 +145,21 @@ def _create_argument_parser() -> argparse.ArgumentParser:
         description='AnyTool - Universal Tool-Use Layer for AI Agents',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    w
+    # Subcommands
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    # Basic arguments
+    # refresh-cache subcommand
+    cache_parser = subparsers.add_parser(
+        'refresh-cache',
+        help='Refresh MCP tool cache (starts all servers once)'
+    )
+    cache_parser.add_argument(
+        '--config', '-c', type=str,
+        help='MCP configuration file path'
+    )
+    
+    # Basic arguments (for run mode)
     parser.add_argument('--config', '-c', type=str, help='Configuration file path (JSON format)')
     parser.add_argument('--query', '-q', type=str, help='Single query mode: execute query directly')
     
@@ -166,6 +179,144 @@ def _create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ui-compact', action='store_true', help='Use compact UI layout')
     
     return parser
+
+
+async def refresh_mcp_cache(config_path: Optional[str] = None):
+    """Refresh MCP tool cache by starting servers one by one and saving tool metadata."""
+    from anytool.grounding.backends.mcp import MCPProvider, get_tool_cache
+    from anytool.grounding.core.types import SessionConfig, BackendType
+    from anytool.config import load_config, get_config
+    
+    print("Refreshing MCP tool cache...")
+    print("Servers will be started one by one (start -> get tools -> close).")
+    print()
+    
+    # Load config
+    if config_path:
+        config = load_config(config_path)
+    else:
+        config = get_config()
+    
+    # Get MCP config
+    mcp_config = getattr(config, 'mcp', None) or {}
+    if hasattr(mcp_config, 'model_dump'):
+        mcp_config = mcp_config.model_dump()
+    
+    # Skip dependency checks for refresh-cache (servers are pre-validated)
+    mcp_config["check_dependencies"] = False
+    
+    # Create provider
+    provider = MCPProvider(config=mcp_config)
+    await provider.initialize()
+    
+    servers = provider.list_servers()
+    total = len(servers)
+    print(f"Found {total} MCP servers configured")
+    print()
+    
+    cache = get_tool_cache()
+    cache.set_server_order(servers)  # Preserve config order when saving
+    total_tools = 0
+    success_count = 0
+    skipped_count = 0
+    failed_servers = []
+    
+    # Load existing cache to skip already processed servers
+    existing_cache = cache.get_all_tools()
+    
+    # Timeout for each server (in seconds)
+    SERVER_TIMEOUT = 60
+    
+    # Process servers one by one
+    for i, server_name in enumerate(servers, 1):
+        # Skip if already cached (resume support)
+        if server_name in existing_cache:
+            cached_tools = existing_cache[server_name]
+            total_tools += len(cached_tools)
+            skipped_count += 1
+            print(f"[{i}/{total}] {server_name}... ⏭ cached ({len(cached_tools)} tools)")
+            continue
+        
+        print(f"[{i}/{total}] {server_name}...", end=" ", flush=True)
+        session_id = f"mcp-{server_name}"
+        
+        try:
+            # Create session and get tools with timeout protection
+            async with asyncio.timeout(SERVER_TIMEOUT):
+                # Create session for this server
+                cfg = SessionConfig(
+                    session_name=session_id,
+                    backend_type=BackendType.MCP,
+                    connection_params={"server": server_name},
+                )
+                session = await provider.create_session(cfg)
+                
+                # Get tools from this server
+                tools = await session.list_tools()
+            
+            # Convert to metadata format
+            tool_metadata = []
+            for tool in tools:
+                tool_metadata.append({
+                    "name": tool.schema.name,
+                    "description": tool.schema.description or "",
+                    "parameters": tool.schema.parameters or {},
+                })
+            
+            # Save to cache (incremental)
+            cache.save_server(server_name, tool_metadata)
+            
+            # Close session immediately to free resources
+            await provider.close_session(session_id)
+            
+            total_tools += len(tools)
+            success_count += 1
+            print(f"✓ {len(tools)} tools")
+        
+        except asyncio.TimeoutError:
+            error_msg = f"Timeout after {SERVER_TIMEOUT}s"
+            failed_servers.append((server_name, error_msg))
+            print(f"✗ {error_msg}")
+            
+            # Save failed server info to cache
+            cache.save_failed_server(server_name, error_msg)
+            
+            # Try to close session if it was created
+            try:
+                await provider.close_session(session_id)
+            except Exception:
+                pass
+            
+        except Exception as e:
+            error_msg = str(e)
+            failed_servers.append((server_name, error_msg))
+            print(f"✗ {error_msg[:50]}")
+            
+            # Save failed server info to cache
+            cache.save_failed_server(server_name, error_msg)
+            
+            # Try to close session if it was created
+            try:
+                await provider.close_session(session_id)
+            except Exception:
+                pass
+    
+    print()
+    print(f"{'='*50}")
+    print(f"✓ Collected {total_tools} tools from {success_count + skipped_count}/{total} servers")
+    if skipped_count > 0:
+        print(f"  (skipped {skipped_count} cached, processed {success_count} new)")
+    print(f"✓ Cache saved to: {cache.cache_path}")
+    
+    if failed_servers:
+        print(f"✗ Failed servers ({len(failed_servers)}):")
+        for name, err in failed_servers[:10]:
+            print(f"  - {name}: {err[:60]}")
+        if len(failed_servers) > 10:
+            print(f"  ... and {len(failed_servers) - 10} more (see cache file for details)")
+    
+    print()
+    print("Done! Future list_tools() calls will use cache (no server startup).")
 
 
 def _load_config(args) -> AnyToolConfig:
@@ -258,6 +409,11 @@ async def _initialize_anytool(config: AnyToolConfig, args) -> AnyTool:
 async def main():
     parser = _create_argument_parser()
     args = parser.parse_args()
+    
+    # Handle subcommands
+    if args.command == 'refresh-cache':
+        await refresh_mcp_cache(args.config)
+        return 0
     
     # Load configuration
     config = _load_config(args)

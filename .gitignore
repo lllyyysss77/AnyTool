@@ -35,6 +35,8 @@ logs/
 
 # Embedding cache
 .anytool/
+embedding_cache/
+tool_quality/
 
 # Config files
 anytool/config/config_dev.json

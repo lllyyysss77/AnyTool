@@ -11,9 +11,62 @@ from anytool.grounding.core.tool import BaseTool
 from anytool.utils.logging import Logger
 
 load_dotenv()
-# litellm._turn_on_debug()
+
+# Disable LiteLLM verbose logging to prevent stdout blocking with large tool schemas
+litellm.set_verbose = False
+litellm.suppress_debug_info = True
 
 logger = Logger.get_logger(__name__)
+
+
+def _sanitize_schema(params: Dict) -> Dict:
+    """Sanitize tool parameter schema to comply with Claude API requirements.
+    
+    Fixes common issues:
+    - Empty object schemas (no properties, no required)
+    - Missing required fields for Claude compatibility
+    """
+    if not params:
+        return {"type": "object", "properties": {}, "required": []}
+    
+    # Deep copy to avoid modifying the original
+    import copy
+    sanitized = copy.deepcopy(params)
+    
+    # Anthropic API requires top-level type to be 'object'
+    # If it's not an object, wrap the schema as a property of an object
+    top_level_type = sanitized.get("type")
+    if top_level_type and top_level_type != "object":
+        # Wrap non-object schema as a single property called "value"
+        logger.debug(f"[SCHEMA_SANITIZE] Wrapping non-object schema (type={top_level_type}) into object")
+        wrapped = {
+            "type": "object",
+            "properties": {
+                "value": sanitized  # The original schema becomes a property
+            },
+            "required": ["value"]  # Make it required
+        }
+        sanitized = wrapped
+    
+    # If type is object but missing properties/required, add them
+    if sanitized.get("type") == "object":
+        if "properties" not in sanitized:
+            sanitized["properties"] = {}
+        if "required" not in sanitized:
+            sanitized["required"] = []
+    
+    # Remove non-standard fields that may cause issues (like 'title')
+    sanitized.pop("title", None)
+    
+    # Recursively sanitize nested properties
+    if "properties" in sanitized and isinstance(sanitized["properties"], dict):
+        for prop_name, prop_schema in list(sanitized["properties"].items()):
+            if isinstance(prop_schema, dict):
+                # Remove title from nested properties
+                prop_schema.pop("title", None)
+    
+    return sanitized
+
 
 def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
     """Convert ToolSchema to OpenAI ChatCompletion tool format"""
@@ -22,9 +75,16 @@ def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
         "description": schema.description or "",
     }
     
-    # Only add parameters field if tool has parameters
+    # Sanitize and add parameters
     if schema.parameters:
-        function_def["parameters"] = schema.parameters
+        sanitized = _sanitize_schema(schema.parameters)
+        function_def["parameters"] = sanitized
+        # Debug: verify sanitization worked
+        if "title" in schema.parameters and "title" not in sanitized:
+            logger.debug(f"Sanitized tool '{schema.name}': removed title")
+    else:
+        # Claude requires parameters field even if empty
+        function_def["parameters"] = {"type": "object", "properties": {}, "required": []}
     
     return { 
         "type": "function",
@@ -34,8 +94,8 @@ def _schema_to_openai(schema: ToolSchema) -> ChatCompletionToolParam:
 def _prepare_tools_for_llmclient(
     tools: List[BaseTool] | None,
     fmt: str = "openai",
-) -> Sequence[Union[ToolSchema, ChatCompletionToolParam]]:
-    """Convert BaseTool list to LLMClient usable format
+) -> tuple[Sequence[Union[ToolSchema, ChatCompletionToolParam]], Dict[str, BaseTool]]:
+    """Convert BaseTool list to LLMClient usable format, with deduplication.
     
     Args:
         tools: BaseTool instance list (should be obtained from GroundingClient and bound to runtime_info)
@@ -43,19 +103,128 @@ def _prepare_tools_for_llmclient(
         fmt: output format, "openai" for OpenAI format
     """
     if not tools:
-        return []
+        return [], {}
     
     if fmt == "openai":
-        return [_schema_to_openai(tool.schema) for tool in tools]
-    return [tool.schema for tool in tools]
+        result = []
+        tool_map = {}  # llm_name -> BaseTool
+        name_count = {}
+        
+        for tool in tools:
+            name = tool.schema.name
+            name_count[name] = name_count.get(name, 0) + 1
+        
 
-def _tool_result_to_message(result: ToolResult, *, tool_call_id: str, tool_name: str) -> Dict:
-    """Convert ToolResult to LLMClient usable message format
+        seen_names = set()
+        for tool in tools:
+            original_name = tool.schema.name
+            
+            if name_count[original_name] > 1:
+                server_name = "unknown"
+                if tool.is_bound and tool.runtime_info and tool.runtime_info.server_name:
+                    server_name = tool.runtime_info.server_name
+                llm_name = f"{server_name}__{original_name}"
+            else:
+                llm_name = original_name
+            
+            if llm_name in seen_names:
+                logger.warning(f"[TOOL_DEDUP] Skipping duplicate tool: {llm_name}")
+                continue
+            seen_names.add(llm_name)
+            
+            tool_param = _schema_to_openai(tool.schema)
+            tool_param["function"]["name"] = llm_name 
+            result.append(tool_param)
+            
+            tool_map[llm_name] = tool
+            
+            if llm_name != original_name:
+                logger.info(f"[TOOL_RENAME] {original_name} -> {llm_name}")
+        
+        logger.info(f"[SCHEMA_SANITIZE] Prepared {len(result)} tools for LLM (from {len(tools)} total)")
+        return result, tool_map
+    
+    tool_map = {tool.schema.name: tool for tool in tools}
+    return [tool.schema for tool in tools], tool_map
+
+DEFAULT_SUMMARIZE_THRESHOLD_CHARS = 200000  # ~50K tokens, lowered from 400K to prevent context overflow
+MAX_TOOL_RESULT_CHARS = 200000  # Fallback truncation limit when summarization fails (~50K tokens)
+
+async def _summarize_tool_result(
+    content: str,
+    tool_name: str,
+    task: str = "",
+    model: str = "anthropic/claude-sonnet-4-5",
+    timeout: float = 60.0
+) -> str:
+    """Use LLM to summarize large tool results."""
+    try:
+        logger.info(f"Summarizing tool result from '{tool_name}': {len(content):,} chars")
+        
+        # Pre-truncate if content is too large for the model (leave room for prompt + output)
+        # Assuming ~4 chars per token, 200K tokens limit, 8K output, ~500 tokens for prompt
+        # Safe input limit: (200K - 8K - 0.5K) * 4 = ~766K chars, but be conservative at 400K
+        max_input_chars = 400000
+        if len(content) > max_input_chars:
+            logger.warning(f"Pre-truncating content for summarization: {len(content):,} -> {max_input_chars:,} chars")
+            content = content[:max_input_chars] + f"\n\n[TRUNCATED for summarization: original was {len(content):,} chars]"
+        
+        task_hint = f"\n\nUser's task: {task}\nSummarize with focus on information relevant to this task." if task else ""
+        
+        prompt = f"""Tool '{tool_name}' returned a large result ({len(content):,} chars). Summarize it concisely.{task_hint}
+
+**Guidelines:**
+- Structured data (coordinates, steps, etc.): Keep key summary (totals, start/end), omit repetitive details.
+- Markup content (HTML, XML): Extract text and key data only, ignore tags/scripts.
+- Long documents: Keep structure outline and essential sections.
+- Lists/arrays: Summarize count and most relevant items.
+- Always preserve: numbers, URLs, file paths, IDs, key identifiers.
+
+Content:
+{content}
+
+Concise summary:"""
+        
+        response = await asyncio.wait_for(
+            litellm.acompletion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=timeout
+            ),
+            timeout=timeout + 5
+        )
+        
+        summary = response.choices[0].message.content.strip()
+        result = f"[SUMMARY of {len(content):,} chars]\n{summary}"
+        
+        logger.info(f"Tool result summarized: {len(content):,} -> {len(result):,} chars")
+        return result
+        
+    except Exception as e:
+        logger.warning(f"Summarization failed for '{tool_name}': {e}")
+        return None
+
+
+async def _tool_result_to_message_async(
+    result: ToolResult, 
+    *, 
+    tool_call_id: str, 
+    tool_name: str,
+    task: str = "",
+    summarize_threshold: int = DEFAULT_SUMMARIZE_THRESHOLD_CHARS,
+    summarize_model: str = "anthropic/claude-sonnet-4-5",
+    enable_summarization: bool = True
+) -> Dict:
+    """Convert ToolResult to LLMClient usable message format with LLM summarization for large results.
 
     Args:
         result: Tool execution result
         tool_call_id: OpenAI tool_call ID
         tool_name: Tool name
+        task: User's original task for context-aware summarization
+        summarize_threshold: If content exceeds this, use LLM summarization
+        summarize_model: Model to use for summarization
+        enable_summarization: Whether to enable LLM summarization
         
     Returns:
         OpenAI ChatCompletion tool message (text only)
@@ -68,6 +237,19 @@ def _tool_result_to_message(result: ToolResult, *, tool_call_id: str, tool_name:
             if isinstance(result.content, str)
             else json.dumps(result.content, ensure_ascii=False, default=str)
         )
+    
+    original_len = len(text_content)
+    
+    # Use LLM summarization if content exceeds threshold
+    if original_len > summarize_threshold and enable_summarization:
+        summary = await _summarize_tool_result(text_content, tool_name, task, summarize_model)
+        if summary:
+            text_content = summary
+        elif original_len > MAX_TOOL_RESULT_CHARS:
+            # Fallback: truncate if summarization failed and content is too large
+            truncate_msg = f"\n\n[TRUNCATED: Original content was {original_len:,} chars, showing first {MAX_TOOL_RESULT_CHARS:,}]"
+            text_content = text_content[:MAX_TOOL_RESULT_CHARS - len(truncate_msg)] + truncate_msg
+            logger.warning(f"Tool result truncated for '{tool_name}': {original_len:,} -> {len(text_content):,} chars (summarization failed)")
     
     return {
         "role": "tool",
@@ -142,6 +324,8 @@ class LLMClient:
         max_retries: int = 3,
         retry_delay: float = 1.0,
         timeout: float = 120.0,
+        summarize_threshold_chars: int = DEFAULT_SUMMARIZE_THRESHOLD_CHARS,
+        enable_tool_result_summarization: bool = True,
         **litellm_kwargs
     ):
         """
@@ -152,6 +336,10 @@ class LLMClient:
             max_retries: Maximum number of retries on rate limit errors
             retry_delay: Initial delay between retries in seconds (exponential backoff)
             timeout: Request timeout in seconds (default: 120s)
+            summarize_threshold_chars: If tool result exceeds this threshold, use LLM to 
+                                       summarize the result (default: 50000 chars ≈ 12.5K tokens)
+            enable_tool_result_summarization: Whether to enable LLM-based summarization for 
+                                              large tool results (default: True)
             **litellm_kwargs: Additional litellm parameters
         """
         self.model = model
@@ -160,6 +348,8 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.timeout = timeout
+        self.summarize_threshold_chars = summarize_threshold_chars
+        self.enable_tool_result_summarization = enable_tool_result_summarization
         self.litellm_kwargs = litellm_kwargs
         self._logger = Logger.get_logger(__name__)
         self._last_call_time = 0.0
@@ -274,8 +464,14 @@ class LLMClient:
         # 1. Process messages
         if isinstance(messages, str):
             current_messages = [{"role": "user", "content": messages}]
+            user_task = messages
         elif isinstance(messages, list):
             current_messages = messages.copy()
+            # Extract first user message as task for context-aware summarization
+            user_task = next(
+                (m.get("content", "") for m in messages if m.get("role") == "user"),
+                ""
+            )
         else:
             raise ValueError("messages must be List[Dict] or str")
         
@@ -290,8 +486,9 @@ class LLMClient:
         
         # 3. if tools are provided, add them to the request
         llm_tools = None
+        tool_map = {}  # llm_name -> BaseTool
         if tools:
-            llm_tools = _prepare_tools_for_llmclient(tools, fmt="openai")
+            llm_tools, tool_map = _prepare_tools_for_llmclient(tools, fmt="openai")
             if llm_tools:
                 completion_kwargs["tools"] = llm_tools
                 completion_kwargs["tool_choice"] = kwargs.get("tool_choice", "auto")
@@ -344,7 +541,6 @@ class LLMClient:
         tool_results = []
         if execute_tools and tool_calls and tools:
             self._logger.info(f"Executing {len(tool_calls)} tool calls...")
-            tool_map = {tool.schema.name: tool for tool in tools}
             
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
@@ -414,10 +610,15 @@ class LLMClient:
                             error=str(e)
                         )
                 
-                tool_message = _tool_result_to_message(
+                # Use async version with LLM summarization for large results
+                tool_message = await _tool_result_to_message_async(
                     result, 
                     tool_call_id=tool_call.id, 
-                    tool_name=tool_name
+                    tool_name=tool_name,
+                    task=user_task,
+                    summarize_threshold=self.summarize_threshold_chars,
+                    summarize_model=self.model,
+                    enable_summarization=self.enable_tool_result_summarization
                 )
                 current_messages.append(tool_message)
                 

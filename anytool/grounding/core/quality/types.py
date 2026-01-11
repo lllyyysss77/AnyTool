@@ -61,6 +61,10 @@ class ToolQualityRecord:
     # Keep only recent N executions
     MAX_RECENT_EXECUTIONS: ClassVar[int] = 100
     
+    # Penalty threshold: only penalize tools with success rate below this value
+    # Tools with success rate >= this threshold get penalty = 1.0 (no penalty)
+    PENALTY_THRESHOLD: ClassVar[float] = 0.4
+    
     @property
     def success_rate(self) -> float:
         """Overall success rate."""
@@ -84,49 +88,58 @@ class ToolQualityRecord:
         return successes / len(self.recent_executions)
     
     @property
+    def consecutive_failures(self) -> int:
+        """Count consecutive failures from the most recent execution."""
+        count = 0
+        for exec_record in reversed(self.recent_executions):
+            if not exec_record.success:
+                count += 1
+            else:
+                break
+        return count
+    
+    @property
+    def penalty(self) -> float:
+        """
+        Compute penalty factor based on failure rate.
+        
+        Design principles:
+        - Only penalize tools with success rate < PENALTY_THRESHOLD (default 40%)
+        - New tools (< 3 calls) get no penalty to allow fair evaluation
+        
+        Returns value between 0.2-1.0:
+        - 1.0: No penalty (success rate >= threshold or insufficient data)
+        - 0.2: Maximum penalty (consistently failing tool)
+        """
+        if self.total_calls < 3:
+            return 1.0
+        
+        success_rate = self.recent_success_rate
+        threshold = self.PENALTY_THRESHOLD
+        
+        if success_rate >= threshold:
+            return 1.0
+        
+        # Linear mapping: penalty = 0.3 + (success_rate / threshold) * 0.7
+        base_penalty = 0.3 + (success_rate / threshold) * 0.7
+        
+        # Extra penalty for consecutive failures (indicates systematic issues)
+        consec = self.consecutive_failures
+        if consec >= 3:
+            # 3 consecutive → extra 0.1, 5 consecutive → extra 0.3
+            extra_penalty = min(0.3, (consec - 2) * 0.1)
+            base_penalty -= extra_penalty
+        
+        # Clamp to [0.2, 1.0]
+        return max(0.2, min(1.0, base_penalty))
+    
+    @property
     def quality_score(self) -> float:
         """
-        Adaptive quality score that balances success rate and description quality.
-        
-        As we gather more execution data, we trust actual performance more.
-        - Few executions (< 3): Only use description quality
-        - Some executions (3-10): Gradually increase weight of success rate
-        - Many executions (>= 10): Heavily favor success rate (80%) over description (20%)
-        
-        Returns value between 0-1.
+        Legacy quality score for backward compatibility.
+        Now delegates to penalty property.
         """
-        # Determine adaptive weights based on execution count
-        if self.total_calls >= 10:
-            # Sufficient data: trust actual performance
-            success_weight = 0.8
-            desc_weight = 0.2
-        elif self.total_calls >= 3:
-            # Partial data: gradually transition from description to performance
-            # Linear interpolation from (3, 0.5) to (10, 0.8)
-            ratio = (self.total_calls - 3) / 7.0
-            success_weight = 0.5 + ratio * 0.3  # 0.5 → 0.8
-            desc_weight = 0.5 - ratio * 0.3      # 0.5 → 0.2
-        else:
-            # Insufficient data: only use description quality
-            success_weight = 0.0
-            desc_weight = 1.0
-        
-        # Compute weighted score
-        score = 0.0
-        total_weight = 0.0
-        
-        if self.total_calls >= 3:
-            score += self.recent_success_rate * success_weight
-            total_weight += success_weight
-        
-        if self.description_quality:
-            score += self.description_quality.overall_score * desc_weight
-            total_weight += desc_weight
-        
-        if total_weight == 0:
-            return 0.5  # Brand new tool with no data
-        
-        return score / total_weight
+        return self.penalty
     
     def add_execution(self, record: ExecutionRecord) -> None:
         """Add execution record and update stats."""

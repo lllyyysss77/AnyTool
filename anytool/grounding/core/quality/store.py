@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 
 from .types import ToolQualityRecord
 from anytool.utils.logging import Logger
+from anytool.config.constants import PROJECT_ROOT
 
 logger = Logger.get_logger(__name__)
 
@@ -18,7 +19,7 @@ class QualityStore:
     Persistent storage for tool quality records.
     
     Storage structure:
-    ~/.anytool/tool_quality/
+    <project_root>/.anytool/tool_quality/
     ├── records.json          # All quality records
     └── records_backup.json   # Backup on save
     """
@@ -27,7 +28,7 @@ class QualityStore:
     
     def __init__(self, cache_dir: Optional[Path] = None):
         if cache_dir is None:
-            cache_dir = Path.home() / ".anytool" / "tool_quality"
+            cache_dir = PROJECT_ROOT / ".anytool" / "tool_quality"
         
         self._cache_dir = Path(cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)

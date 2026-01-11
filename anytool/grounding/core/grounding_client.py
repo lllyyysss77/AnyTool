@@ -528,6 +528,17 @@ class GroundingClient:
         backend = self._session_info[session_name].backend_type
         return await self.list_tools(backend, session_name, use_cache)
 
+    async def list_all_backend_tools(
+        self,
+        use_cache: bool = False
+    ) -> Dict[BackendType, list[BaseTool]]:
+        """List static tools for every registered backend."""
+        result = {}
+        for backend_type in self.list_providers().keys():
+            tools = await self.list_backend_tools(backend=backend_type, use_cache=use_cache)
+            result[backend_type] = tools
+        return result
+
     async def search_tools(
         self,
         task_description: str,
@@ -600,6 +611,16 @@ class GroundingClient:
             # fallback: return top N tools
             fallback_max = max_tools or self._config.tool_search.max_tools
             return candidate_tools[:fallback_max]
+    
+    def get_last_search_debug_info(self) -> Optional[Dict[str, Any]]:
+        """Get debug info from the last tool search operation.
+        
+        Returns:
+            Dict containing search debug info, or None if no search has been performed.
+        """
+        if self._search_coordinator is None:
+            return None
+        return self._search_coordinator.get_last_search_debug_info()
     
     async def get_tools_with_auto_search(
         self,
@@ -844,8 +865,10 @@ class GroundingClient:
         
         # Execute the tool
         # Ensure session exists (except for SYSTEM backend which doesn't use sessions)
-        if not runtime_session and runtime_backend != BackendType.SYSTEM:
-            runtime_session = await self.ensure_session(runtime_backend, runtime_server)
+        # Check if session really exists - cached tools have session_name but session may not be running
+        if runtime_backend != BackendType.SYSTEM:
+            if not runtime_session or runtime_session not in self._sessions:
+                runtime_session = await self.ensure_session(runtime_backend, runtime_server)
         
         try:
             provider = self._registry.get(runtime_backend)

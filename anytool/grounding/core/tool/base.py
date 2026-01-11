@@ -7,7 +7,7 @@ import asyncio, time, inspect
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import Any, ClassVar, Dict, Optional, TYPE_CHECKING
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from ..types import BackendType, ToolResult, ToolSchema, ToolStatus
 from ..exceptions import GroundingError, ErrorCode
@@ -107,7 +107,11 @@ class BaseTool(ABC):
         if not fields:
             return {}
         
-        PModel: type[BaseModel] = create_model(f"{cls.__name__}Params", **fields) 
+        PModel: type[BaseModel] = create_model(
+            f"{cls.__name__}Params",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            **fields
+        )
         return PModel.model_json_schema()
 
     def validate_parameters(self, params: Dict[str, Any]) -> None:

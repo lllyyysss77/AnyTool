@@ -27,6 +27,10 @@ class AnyToolConfig:
     llm_rate_limit_delay: float = 0.0
     llm_kwargs: Dict[str, Any] = field(default_factory=dict)
     
+    # Separate models for specific tasks (None = use llm_model)
+    tool_retrieval_model: Optional[str] = None  # Model for tool retrieval LLM filter
+    visual_analysis_model: Optional[str] = None  # Model for visual analysis
+    
     # Grounding Configuration
     grounding_config_path: Optional[str] = None
     grounding_max_iterations: int = 20
@@ -120,9 +124,10 @@ class AnyTool:
             
             agent_config = get_agent_config("GroundingAgent")
             if agent_config:
-                # Use config file values, fall back to AnyToolConfig defaults
+                # Use config file values, but command-line args (self.config) take priority
                 max_iterations = agent_config.get("max_iterations", self.config.grounding_max_iterations)
-                backend_scope = agent_config.get("backend_scope", self.config.backend_scope or ["gui", "shell", "mcp", "web", "system"])
+                # Command-line backend_scope > config file > default
+                backend_scope = self.config.backend_scope or agent_config.get("backend_scope") or ["gui", "shell", "mcp", "web", "system"]
                 visual_analysis_timeout = agent_config.get("visual_analysis_timeout", 30.0)
                 # Update config with values from config file
                 self.config.grounding_max_iterations = max_iterations
@@ -134,6 +139,16 @@ class AnyTool:
                 visual_analysis_timeout = 30.0
                 logger.warning(f"config_agents.json not found, using default config (max_iterations={max_iterations})")
             
+            # Create separate LLM client for tool retrieval if configured
+            tool_retrieval_llm = None
+            if self.config.tool_retrieval_model:
+                tool_retrieval_llm = LLMClient(
+                    model=self.config.tool_retrieval_model,
+                    timeout=self.config.llm_timeout,
+                    max_retries=self.config.llm_max_retries,
+                )
+                logger.info(f"✓ Tool retrieval LLM: {self.config.tool_retrieval_model}")
+            
             self._grounding_agent = GroundingAgent(
                 name="AnyTool-GroundingAgent",
                 backend_scope=backend_scope,
@@ -143,6 +158,8 @@ class AnyTool:
                 system_prompt=self.config.grounding_system_prompt,
                 max_iterations=max_iterations,
                 visual_analysis_timeout=visual_analysis_timeout,
+                tool_retrieval_llm=tool_retrieval_llm,
+                visual_analysis_model=self.config.visual_analysis_model,
             )
             logger.info(f"✓ GroundingAgent: {', '.join(backend_scope)}")
             

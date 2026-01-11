@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 from .types import ToolQualityRecord, ExecutionRecord, DescriptionQuality
 from .store import QualityStore
 from anytool.utils.logging import Logger
+from anytool.config.constants import PROJECT_ROOT
 
 if TYPE_CHECKING:
     from anytool.grounding.core.tool import BaseTool
@@ -48,7 +49,7 @@ class ToolQualityManager:
         auto_save: bool = True,
         evolve_interval: int = 5,
     ):
-        self._cache_dir = cache_dir or Path.home() / ".anytool" / "tool_quality"
+        self._cache_dir = cache_dir or PROJECT_ROOT / ".anytool" / "tool_quality"
         self._llm_client = llm_client
         self._enable_persistence = enable_persistence
         self._auto_save = auto_save
@@ -328,27 +329,16 @@ Respond with JSON only:
         tools_with_scores: List[Tuple["BaseTool", float]],
     ) -> List[Tuple["BaseTool", float]]:
         """
-        Adjust tool ranking by incorporating quality scores.
-        
-        Combines semantic similarity with quality score using weighted sum:
-        final_score = (1 - quality_weight) * semantic_score + quality_weight * quality_score
-        
+        Adjust tool ranking using penalty-based approach.
+           
         Args:
             tools_with_scores: List of (tool, semantic_score) tuples
         """
-        # Use adaptive weight based on data maturity
-        quality_weight = self.compute_adaptive_quality_weight()
-        semantic_weight = 1 - quality_weight
-        
         adjusted = []
         for tool, semantic_score in tools_with_scores:
-            quality_score = self.get_quality_score(tool)
+            penalty = self.get_penalty(tool)
             
-            # Weighted combination of semantic match and quality
-            adjusted_score = (
-                semantic_weight * semantic_score +
-                quality_weight * quality_score
-            )
+            adjusted_score = semantic_score * penalty
             
             adjusted.append((tool, adjusted_score))
         
@@ -356,6 +346,10 @@ Respond with JSON only:
         adjusted.sort(key=lambda x: x[1], reverse=True)
         
         return adjusted
+    
+    def get_penalty(self, tool: "BaseTool") -> float:
+        """Get penalty factor for a tool (0.2-1.0)."""
+        return self.get_record(tool).penalty
     
     # Change Detection
     def check_changes(self, tools: List["BaseTool"]) -> Dict[str, str]:

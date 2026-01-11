@@ -55,18 +55,19 @@ async def create_connector_from_config(
         RuntimeError: If dependencies are not installed and user declines installation
     """
     
+    # Get original command and args from config
+    original_command = get_config_value(server_config, "command")
+    original_args = get_config_value(server_config, "args", [])
+
     # Check and install dependencies if needed (only for stdio servers)
     if is_stdio_server(server_config) and check_dependencies:
-        command = get_config_value(server_config, "command")
-        args = get_config_value(server_config, "args", [])
-        
         # Use provided installer or get global instance
         if installer is None:
             from .installer import get_global_installer
             installer = get_global_installer()
-        
-        # Ensure dependencies are installed
-        await installer.ensure_dependencies(server_name, command, args)
+
+        # Ensure dependencies are installed (using original command/args)
+        await installer.ensure_dependencies(server_name, original_command, original_args)
 
     # Stdio connector (command-based)
     if is_stdio_server(server_config) and not sandbox:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -28,6 +29,8 @@ class GroundingAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         max_iterations: int = 15,
         visual_analysis_timeout: float = 30.0,
+        tool_retrieval_llm: Optional[LLMClient] = None,
+        visual_analysis_model: Optional[str] = None,
     ) -> None:
         """
         Initialize the Grounding Agent.
@@ -41,6 +44,8 @@ class GroundingAgent(BaseAgent):
             system_prompt: Custom system prompt
             max_iterations: Maximum LLM reasoning iterations for self-correction
             visual_analysis_timeout: Timeout for visual analysis LLM calls in seconds
+            tool_retrieval_llm: LLM client for tool retrieval filter (None = use llm_client)
+            visual_analysis_model: Model name for visual analysis (None = use llm_client.model)
         """
         super().__init__(
             name=name,
@@ -53,11 +58,17 @@ class GroundingAgent(BaseAgent):
         self._system_prompt = system_prompt or self._default_system_prompt()
         self._max_iterations = max_iterations
         self._visual_analysis_timeout = visual_analysis_timeout
+        self._tool_retrieval_llm = tool_retrieval_llm
+        self._visual_analysis_model = visual_analysis_model
         
         logger.info(f"Grounding Agent initialized: {name}")
         logger.info(f"Backend scope: {self._backend_scope}")
         logger.info(f"Max iterations: {self._max_iterations}")
         logger.info(f"Visual analysis timeout: {self._visual_analysis_timeout}s")
+        if tool_retrieval_llm:
+            logger.info(f"Tool retrieval model: {tool_retrieval_llm.model}")
+        if visual_analysis_model:
+            logger.info(f"Visual analysis model: {visual_analysis_model}")
     
     async def process(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -82,10 +93,46 @@ class GroundingAgent(BaseAgent):
         # Get available tools (auto-search with cap)
         tools = await self._get_available_tools(instruction)
         
+        # Get search debug info (similarity scores, LLM selections)
+        search_debug_info = None
+        if self.grounding_client:
+            search_debug_info = self.grounding_client.get_last_search_debug_info()
+        
+        # Build retrieved tools list for return value
+        retrieved_tools_list = []
+        for tool in tools:
+            tool_info = {
+                "name": getattr(tool, "name", str(tool)),
+                "description": getattr(tool, "description", ""),
+            }
+            if hasattr(tool, "backend_type"):
+                tool_info["backend"] = tool.backend_type.value if hasattr(tool.backend_type, "value") else str(tool.backend_type)
+            if hasattr(tool, "_runtime_info") and tool._runtime_info:
+                tool_info["server_name"] = tool._runtime_info.server_name
+            
+            # Add similarity score if available
+            if search_debug_info and search_debug_info.get("tool_scores"):
+                for score_info in search_debug_info["tool_scores"]:
+                    if score_info["name"] == tool_info["name"]:
+                        tool_info["similarity_score"] = score_info["score"]
+                        break
+            
+            retrieved_tools_list.append(tool_info)
+        
+        # Record retrieved tools
+        if self._recording_manager:
+            from anytool.recording import RecordingManager
+            await RecordingManager.record_retrieved_tools(
+                task_instruction=instruction,
+                tools=tools,
+                search_debug_info=search_debug_info,
+            )
+        
         # Initialize iteration state
         max_iterations = context.get("max_iterations", self._max_iterations)
         current_iteration = 0
         all_tool_results = []
+        iteration_contexts = []
         
         # Build initial messages
         messages = self.construct_messages(context)
@@ -95,22 +142,25 @@ class GroundingAgent(BaseAgent):
                 current_iteration += 1
                 logger.info(f"Grounding Agent: Iteration {current_iteration}/{max_iterations}")
                 
-                # Build iteration summary prompt for LLMClient
-                # This will be used by LLMClient to automatically generate summary after tool execution
-                iteration_summary_prompt = GroundingAgentPrompts.iteration_summary(
-                    instruction=instruction,
-                    iteration=current_iteration,
-                    max_iterations=max_iterations
-                ) if context.get("auto_execute", True) else None
+                messages_input_snapshot = copy.deepcopy(messages)
+                
+                # [DISABLED] Iteration summary generation
+                # Tool results (including visual analysis) are already in context,
+                # LLM can make decisions directly without separate summary.
+                # To re-enable, uncomment below and pass iteration_summary_prompt to complete()
+                # iteration_summary_prompt = GroundingAgentPrompts.iteration_summary(
+                #     instruction=instruction,
+                #     iteration=current_iteration,
+                #     max_iterations=max_iterations
+                # ) if context.get("auto_execute", True) else None
                 
                 # Call LLMClient for single round
                 # LLM will decide whether to call tools or finish with <COMPLETE>
-                # If tools are executed, LLMClient will automatically generate iteration summary
                 llm_response = await self._llm_client.complete(
                     messages=messages,
                     tools=tools if context.get("auto_execute", True) else None,
                     execute_tools=context.get("auto_execute", True),
-                    summary_prompt=iteration_summary_prompt, 
+                    summary_prompt=None,  # Disabled
                     tool_result_callback=self._visual_analysis_callback
                 )
                 
@@ -122,9 +172,10 @@ class GroundingAgent(BaseAgent):
                 if tool_results_this_iteration:
                     all_tool_results.extend(tool_results_this_iteration)
 
-                llm_summary = llm_response.get("iteration_summary")
-                if llm_summary:
-                    logger.info(f"Iteration {current_iteration} summary: {llm_summary[:150]}...")
+                # [DISABLED] Iteration summary logging
+                # llm_summary = llm_response.get("iteration_summary")
+                # if llm_summary:
+                #     logger.info(f"Iteration {current_iteration} summary: {llm_summary[:150]}...")
                 
                 assistant_message = llm_response.get("message", {})
                 assistant_content = assistant_message.get("content", "")
@@ -140,16 +191,33 @@ class GroundingAgent(BaseAgent):
                     if not has_tool_calls:
                         logger.warning(f"Iteration {current_iteration} - NO tool calls and NO content (potential infinite loop)")
                 
-                # Check for completion in both assistant content and iteration summary
-                is_complete = (
-                    GroundingAgentPrompts.TASK_COMPLETE in assistant_content or
-                    (llm_summary and GroundingAgentPrompts.TASK_COMPLETE in llm_summary)
-                )
+                # Snapshot messages after LLM call (accumulated context)
+                messages_output_snapshot = copy.deepcopy(messages)
+                
+                # Record iteration context
+                iteration_contexts.append({
+                    "iteration": current_iteration,
+                    "messages_input": messages_input_snapshot,
+                    "messages_output": messages_output_snapshot,
+                    "llm_response_summary": {
+                        "assistant_content": assistant_content,
+                        "has_tool_calls": has_tool_calls,
+                        # "iteration_summary": llm_summary,  # Disabled with iteration summary
+                        "tool_calls_count": len(tool_results_this_iteration),
+                    },
+                })
+                
+                # Check for completion token in assistant content
+                # [DISABLED] Also check in iteration summary when enabled
+                # is_complete = (
+                #     GroundingAgentPrompts.TASK_COMPLETE in assistant_content or
+                #     (llm_summary and GroundingAgentPrompts.TASK_COMPLETE in llm_summary)
+                # )
+                is_complete = GroundingAgentPrompts.TASK_COMPLETE in assistant_content
                 
                 if is_complete:
                     # Task is complete - LLM generated completion token
-                    source = "assistant content" if GroundingAgentPrompts.TASK_COMPLETE in assistant_content else "iteration summary"
-                    logger.info(f"Task completed at iteration {current_iteration} (found {GroundingAgentPrompts.TASK_COMPLETE} in {source})")
+                    logger.info(f"Task completed at iteration {current_iteration} (found {GroundingAgentPrompts.TASK_COMPLETE})")
                     break
                 
                 else:
@@ -159,21 +227,31 @@ class GroundingAgent(BaseAgent):
                     else:
                         logger.debug(f"Task in progress, LLM did not generate <COMPLETE>")
                     
-                    # Remove guidance from previous iteration feedback (keep summary content)
-                    self._remove_previous_guidance(messages)
+                    # Remove previous iteration guidance to avoid accumulation
+                    messages = [
+                        msg for msg in messages 
+                        if not (msg.get("role") == "system" and "Iteration" in msg.get("content", "") and "complete" in msg.get("content", ""))
+                    ]
                     
-                    # Build feedback message for next iteration (with guidance)
-                    feedback_msg = self._build_iteration_feedback(
-                        iteration=current_iteration,
-                        llm_summary=llm_summary,
-                        add_guidance=True
-                    )
+                    guidance_msg = {
+                        "role": "system",
+                        "content": f"Iteration {current_iteration} complete. "
+                                   f"Check if task is finished - if yes, output {GroundingAgentPrompts.TASK_COMPLETE}. "
+                                   f"If not, continue with next action."
+                    }
+                    messages.append(guidance_msg)
                     
-                    if feedback_msg:
-                        messages.append(feedback_msg)
-                        logger.debug(f"Added iteration {current_iteration} feedback with guidance")
+                    # [DISABLED] Full iteration feedback with summary
+                    # self._remove_previous_guidance(messages)
+                    # feedback_msg = self._build_iteration_feedback(
+                    #     iteration=current_iteration,
+                    #     llm_summary=llm_summary,
+                    #     add_guidance=True
+                    # )
+                    # if feedback_msg:
+                    #     messages.append(feedback_msg)
+                    #     logger.debug(f"Added iteration {current_iteration} feedback with guidance")
                     
-                    # Continue to next iteration
                     continue
             
             # Build final result
@@ -182,7 +260,10 @@ class GroundingAgent(BaseAgent):
                 messages=messages,
                 all_tool_results=all_tool_results,
                 iterations=current_iteration,
-                max_iterations=max_iterations
+                max_iterations=max_iterations,
+                iteration_contexts=iteration_contexts,
+                retrieved_tools_list=retrieved_tools_list,
+                search_debug_info=search_debug_info,
             )
             
             # Record agent action to recording manager
@@ -268,10 +349,13 @@ class GroundingAgent(BaseAgent):
         backends = [BackendType(name) for name in self._backend_scope]
 
         try:
+            # Use dedicated tool retrieval LLM if configured, otherwise use main LLM
+            retrieval_llm = self._tool_retrieval_llm or self._llm_client
             tools = await grounding_client.get_tools_with_auto_search(
                 task_description=task_description,
                 backend=backends,
                 use_cache=True,
+                llm_callable=retrieval_llm,
             )
             logger.info(
                 f"GroundingAgent selected {len(tools)} tools (auto-search) from {len(backends)} backends"
@@ -423,9 +507,11 @@ class GroundingAgent(BaseAgent):
                     }
                 })
 
+            # Use dedicated visual analysis model if configured, otherwise use main LLM model
+            visual_model = self._visual_analysis_model or (self._llm_client.model if self._llm_client else "anthropic/claude-sonnet-4-5")
             response = await asyncio.wait_for(
                 litellm.acompletion(
-                    model=self._llm_client.model if self._llm_client else "anthropic/claude-sonnet-4-5",
+                    model=visual_model,
                     messages=[{
                         "role": "user",
                         "content": content
@@ -659,9 +745,15 @@ class GroundingAgent(BaseAgent):
         instruction: str,
         messages: List[Dict],
         iterations: int
-    ) -> str:
+    ) -> tuple[str, bool, List[Dict]]:
         """
         Generate final summary across all iterations for reporting to upper layer.
+        
+        Returns:
+            tuple[str, bool, List[Dict]]: (summary_text, success_flag, context_used)
+                - summary_text: The generated summary or error message
+                - success_flag: True if summary was generated successfully, False otherwise
+                - context_used: The cleaned messages used for generating summary
         """
         final_summary_prompt = {
             "role": "user",
@@ -671,14 +763,27 @@ class GroundingAgent(BaseAgent):
             )
         }
         
-        summary_messages = messages.copy()
-        summary_messages.append(final_summary_prompt)
+        clean_messages = []
+        for msg in messages:
+            # Skip tool result messages
+            if msg.get("role") == "tool":
+                continue
+            # Copy message and remove tool_calls if present
+            clean_msg = msg.copy()
+            if "tool_calls" in clean_msg:
+                del clean_msg["tool_calls"]
+            clean_messages.append(clean_msg)
+        
+        clean_messages.append(final_summary_prompt)
+        
+        # Save context for return
+        context_for_return = copy.deepcopy(clean_messages)
         
         try:
             # Call LLMClient to generate final summary (without tools)
             summary_response = await self._llm_client.complete(
-                messages=summary_messages,
-                tools=[],
+                messages=clean_messages,
+                tools=None,
                 execute_tools=False
             )
             
@@ -686,14 +791,14 @@ class GroundingAgent(BaseAgent):
             
             if final_summary:
                 logger.info(f"Generated final summary: {final_summary[:200]}...")
-                return final_summary
+                return final_summary, True, context_for_return
             else:
                 logger.warning("LLM returned empty final summary")
-                return f"Task completed after {iterations} iteration(s). Check execution history for details."
+                return f"Task completed after {iterations} iteration(s). Check execution history for details.", True, context_for_return
         
         except Exception as e:
             logger.error(f"Error generating final summary: {e}")
-            return f"Task completed after {iterations} iteration(s), but failed to generate summary: {str(e)}"
+            return f"Task completed after {iterations} iteration(s), but failed to generate summary: {str(e)}", False, context_for_return
     
 
     async def _build_final_result(
@@ -702,7 +807,10 @@ class GroundingAgent(BaseAgent):
         messages: List[Dict],
         all_tool_results: List[Dict],
         iterations: int,
-        max_iterations: int
+        max_iterations: int,
+        iteration_contexts: List[Dict] = None,
+        retrieved_tools_list: List[Dict] = None,
+        search_debug_info: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
         """
         Build final execution result.
@@ -713,6 +821,9 @@ class GroundingAgent(BaseAgent):
             all_tool_results: All tool execution results
             iterations: Number of iterations performed
             max_iterations: Maximum allowed iterations
+            iteration_contexts: Context snapshots for each iteration
+            retrieved_tools_list: List of tools retrieved for this task
+            search_debug_info: Debug info from tool search (similarity scores, LLM selections)
         """
         is_complete = self._check_task_completion(messages)
         
@@ -724,18 +835,29 @@ class GroundingAgent(BaseAgent):
             "iterations": iterations,
             "tool_executions": tool_executions,
             "messages": messages,
+            "iteration_contexts": iteration_contexts or [],
+            "retrieved_tools_list": retrieved_tools_list or [],
+            "search_debug_info": search_debug_info,
             "keep_session": True
         }
         
         if is_complete:
-            logger.info("Task completed with <COMPLETE> marker, generating final summary...")
-            final_summary = await self._generate_final_summary(
-                instruction=instruction,
-                messages=messages,
-                iterations=iterations
-            )
-            result["response"] = final_summary
+            logger.info("Task completed with <COMPLETE> marker")
+            # Use LLM's own completion response directly (no extra LLM call needed)
+            # LLM already generates a summary before outputting <COMPLETE>
+            last_response = self._extract_last_assistant_message(messages)
+            # Remove the <COMPLETE> token from response for cleaner output
+            result["response"] = last_response.replace(GroundingAgentPrompts.TASK_COMPLETE, "").strip()
             result["status"] = "success"
+            
+            # [DISABLED] Extra LLM call to generate final summary
+            # final_summary, summary_success, final_summary_context = await self._generate_final_summary(
+            #     instruction=instruction,
+            #     messages=messages,
+            #     iterations=iterations
+            # )
+            # result["response"] = final_summary
+            # result["final_summary_context"] = final_summary_context
         else:
             result["response"] = self._extract_last_assistant_message(messages)
             result["status"] = "incomplete"
@@ -750,14 +872,44 @@ class GroundingAgent(BaseAgent):
         executions = []
         for tr in all_tool_results:
             tool_result_obj = tr.get("result")
+            tool_call = tr.get("tool_call")
             
             status = "unknown"
             if hasattr(tool_result_obj, 'status'):
                 status_obj = tool_result_obj.status
                 status = getattr(status_obj, 'value', status_obj)
             
+            # Extract tool_name and arguments from tool_call object (litellm format)
+            tool_name = "unknown"
+            arguments = {}
+            if tool_call is not None:
+                if hasattr(tool_call, 'function'):
+                    # tool_call is an object with .function attribute
+                    tool_name = getattr(tool_call.function, 'name', 'unknown')
+                    args_raw = getattr(tool_call.function, 'arguments', '{}')
+                    if isinstance(args_raw, str):
+                        try:
+                            arguments = json.loads(args_raw) if args_raw.strip() else {}
+                        except json.JSONDecodeError:
+                            arguments = {}
+                    else:
+                        arguments = args_raw if isinstance(args_raw, dict) else {}
+                elif isinstance(tool_call, dict):
+                    # Fallback: tool_call is a dict
+                    func = tool_call.get("function", {})
+                    tool_name = func.get("name", "unknown")
+                    args_raw = func.get("arguments", "{}")
+                    if isinstance(args_raw, str):
+                        try:
+                            arguments = json.loads(args_raw) if args_raw.strip() else {}
+                        except json.JSONDecodeError:
+                            arguments = {}
+                    else:
+                        arguments = args_raw if isinstance(args_raw, dict) else {}
+            
             executions.append({
-                "tool_name": tr.get("tool_call", {}).get("function", {}).get("name", "unknown"),
+                "tool_name": tool_name,
+                "arguments": arguments,
                 "backend": tr.get("backend"),
                 "server_name": tr.get("server_name"),
                 "status": status,

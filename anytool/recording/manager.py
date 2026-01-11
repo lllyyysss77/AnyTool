@@ -82,6 +82,60 @@ class RecordingManager:
         return cls._global_instance is not None and cls._global_instance._is_started
     
     @classmethod
+    async def record_retrieved_tools(
+        cls,
+        task_instruction: str,
+        tools: List[Any],
+        search_debug_info: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Record the tools retrieved for a task
+        
+        Args:
+            task_instruction: The task instruction used for retrieval
+            tools: List of retrieved tools
+            search_debug_info: Debug info from search (similarity scores, LLM selections)
+        """
+        instance = cls._global_instance
+        if not instance or not instance._is_started or not instance._recorder:
+            return
+        
+        # Extract tool info
+        tool_info = []
+        for tool in tools:
+            info = {
+                "name": getattr(tool, "name", str(tool)),
+            }
+            if hasattr(tool, "backend_type"):
+                info["backend"] = tool.backend_type.value if hasattr(tool.backend_type, "value") else str(tool.backend_type)
+            if hasattr(tool, "_runtime_info") and tool._runtime_info:
+                info["server_name"] = tool._runtime_info.server_name
+            tool_info.append(info)
+        
+        # Build metadata
+        metadata = {
+            "instruction": task_instruction[:500],  # Truncate long instructions
+            "count": len(tools),
+            "tools": tool_info,
+        }
+        
+        # Add search debug info if available
+        if search_debug_info:
+            metadata["search_debug"] = {
+                "search_mode": search_debug_info.get("search_mode", ""),
+                "total_candidates": search_debug_info.get("total_candidates", 0),
+                "mcp_count": search_debug_info.get("mcp_count", 0),
+                "non_mcp_count": search_debug_info.get("non_mcp_count", 0),
+                "llm_filter": search_debug_info.get("llm_filter", {}),
+                "tool_scores": search_debug_info.get("tool_scores", []),
+            }
+        
+        # Save to metadata
+        await instance._recorder.add_metadata("retrieved_tools", metadata)
+        
+        logger.info(f"Recorded {len(tools)} retrieved tools (with search debug info: {search_debug_info is not None})")
+    
+    @classmethod
     async def record_tool_execution(
         cls,
         tool_name: str,

@@ -147,7 +147,7 @@ class ToolSearchConfig(BaseModel):
     )
     cache_dir: Optional[str] = Field(
         None,
-        description="Directory for embedding cache. None means use default ~/.anytool/embedding_cache"
+        description="Directory for embedding cache. None means use default <project_root>/.anytool/embedding_cache"
     )
     
     @field_validator('search_mode')
@@ -171,7 +171,7 @@ class ToolQualityConfig(BaseModel):
     )
     cache_dir: Optional[str] = Field(
         None,
-        description="Directory for quality cache. None means use default ~/.anytool/tool_quality"
+        description="Directory for quality cache. None means use default <project_root>/.anytool/tool_quality"
     )
     auto_evaluate_descriptions: bool = Field(
         True,

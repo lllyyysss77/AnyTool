@@ -175,7 +175,18 @@ Guidelines:
         """
         Build workspace directory information for cross-iteration/cross-backend data sharing.
         """
-        return f"""**Working Directory**: `{workspace_dir}`
+        # Check if this is a benchmark scenario (LiveMCPBench /root mapping)
+        # In benchmark mode, paths in query are already converted by caller (e.g., map_path_to_local)
+        is_benchmark = "/root" in workspace_dir or "LiveMCPBench/root" in workspace_dir
+        
+        if is_benchmark:
+            # Benchmark mode: all task files are in workspace directory
+            return f"""**Working Directory**: `{workspace_dir}`
+- All task files (input/output) are located in this directory
+- Read from and write to this directory for all file operations"""
+        else:
+            # Normal mode: workspace is for intermediate results
+            return f"""**Working Directory**: `{workspace_dir}`
 - Persist intermediate results here; later iterations/backends can read what you saved earlier
 - Note: User's personal files are NOT here - search in ~/Desktop, ~/Documents, ~/Downloads, etc."""
     
